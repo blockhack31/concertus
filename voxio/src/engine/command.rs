@@ -44,6 +44,7 @@ struct VoxWorker {
     resampler: Option<VoxResampler>,
     pending: Vec<f32>,
     input_channels: usize,
+    deferred_next: Option<String>,
 }
 
 pub fn spawn(
@@ -81,6 +82,7 @@ impl VoxWorker {
             resampler: None,
             pending: Vec::with_capacity(PENDING_CAPACITY),
             input_channels: 2,
+            deferred_next: None,
         }
     }
 
@@ -114,6 +116,11 @@ impl VoxWorker {
     }
 
     fn poll_commands(&mut self) -> Result<()> {
+        // Process any deferred queue_next from a previous play cycle
+        if let Some(path) = self.deferred_next.take() {
+            self.queue_next(path)?;
+        }
+
         let mut pending_seek: Option<f64> = None;
         let mut pending_next: Option<String> = None;
         let mut pending_play: Option<String> = None;
@@ -160,6 +167,12 @@ impl VoxWorker {
         // Execute final coalesced operations
         if let Some(path) = pending_play {
             self.handle_play(path)?;
+            // Defer queue_next so it doesn't block the play path.
+            // It will be processed on the next poll_commands iteration,
+            // after decode has already started producing samples.
+            if let Some(path) = pending_next.take() {
+                self.deferred_next = Some(path);
+            }
         }
         if let Some(target) = pending_seek {
             self.handle_seek(target)?;
@@ -279,9 +292,6 @@ impl VoxWorker {
         }
         self.state.reset_samples();
 
-        self.state.set_active(true);
-        self.state.set_paused(false);
-
         match VoxDecoder::open(&path) {
             Ok(decoder) => {
                 let info = &decoder.info;
@@ -302,6 +312,13 @@ impl VoxWorker {
                 self.resampler =
                     VoxResampler::new(info.sample_rate, self.output_rate, info.channels)?;
                 self.current = Some(decoder);
+
+                self.state.set_active(true);
+                self.state.set_paused(false);
+
+                // Prefill the ring buffer before unblocking the audio callback
+                let current_generation = self.state.seek_generation();
+                self.prefill_after_seek(current_generation)?;
             }
             Err(e) => {
                 eprintln!("Failed to open {}: {}", path, e);
@@ -473,6 +490,7 @@ fn get_mapped_sample(samples: &[f32], frame: usize, out_ch: usize, input_channel
 }
 
 /// Push samples to producer with channel mapping (blocking).
+/// Uses batch writes to minimize atomic overhead.
 fn push_samples_mapped(
     producer: &mut Producer<f32>,
     samples: &[f32],
@@ -480,19 +498,31 @@ fn push_samples_mapped(
     output_channels: usize,
 ) {
     let frame_count = samples.len() / input_channels;
+    let total_out = frame_count * output_channels;
+    let mut written = 0;
 
-    for frame in 0..frame_count {
-        for out_ch in 0..output_channels {
-            let sample = get_mapped_sample(samples, frame, out_ch, input_channels);
-            while producer.push(sample).is_err() {
-                thread::sleep(Duration::from_micros(100));
-            }
+    while written < total_out {
+        let available = producer.slots();
+        if available == 0 {
+            thread::sleep(Duration::from_micros(100));
+            continue;
         }
+
+        let to_write = (total_out - written).min(available);
+        if let Ok(chunk) = producer.write_chunk_uninit(to_write) {
+            let start = written;
+            chunk.fill_from_iter((start..start + to_write).map(|idx| {
+                let frame = idx / output_channels;
+                let out_ch = idx % output_channels;
+                get_mapped_sample(samples, frame, out_ch, input_channels)
+            }));
+        }
+        written += to_write;
     }
 }
 
 /// Push samples to producer with channel mapping, returning count of samples pushed.
-/// Non-blocking: skips samples if buffer is full.
+/// Non-blocking: writes as many as the buffer can hold.
 fn push_samples_mapped_count(
     producer: &mut Producer<f32>,
     samples: &[f32],
@@ -500,16 +530,21 @@ fn push_samples_mapped_count(
     output_channels: usize,
 ) -> usize {
     let frame_count = samples.len() / input_channels;
-    let mut pushed = 0;
+    let total_out = frame_count * output_channels;
 
-    for frame in 0..frame_count {
-        for out_ch in 0..output_channels {
-            let sample = get_mapped_sample(samples, frame, out_ch, input_channels);
-            if producer.push(sample).is_ok() {
-                pushed += 1;
-            }
-        }
+    let available = producer.slots();
+    if available == 0 {
+        return 0;
     }
 
-    pushed
+    let to_write = total_out.min(available);
+    if let Ok(chunk) = producer.write_chunk_uninit(to_write) {
+        chunk.fill_from_iter((0..to_write).map(|idx| {
+            let frame = idx / output_channels;
+            let out_ch = idx % output_channels;
+            get_mapped_sample(samples, frame, out_ch, input_channels)
+        }));
+    }
+
+    to_write
 }
